@@ -1,0 +1,5 @@
+__pycache__
+*.pyc
+.ipynb*
+*.nii.gz
+ctp_example

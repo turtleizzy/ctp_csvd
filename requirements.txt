@@ -1,0 +1,10 @@
+numpy
+scipy
+SimpleITK
+connected-components-3d
+scikit-image
+pydicom
+pandas
+
+# for visualization
+matplotlib
