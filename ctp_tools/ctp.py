@@ -1,7 +1,8 @@
 import pydicom
-from skimage.morphology import binary_dilation, binary_erosion
+from scipy.ndimage import binary_dilation, binary_erosion
 import cc3d
 from scipy.optimize import curve_fit
+from scipy.linalg import toeplitz
 import traceback
 import SimpleITK as sitk
 import numpy as np
@@ -258,59 +259,82 @@ def viewImDiagnostic(imLst, window=(200, 500), cols=6):
         ax.axis('off')
         ax.imshow(imSlice, cmap=plt.cm.Greys_r)
 
-def runDeconv(imCTC, tIdx, brainMask, aifProps, cSVDThres=0.1, outputMethod='aggregate', outsideValue=-1):
-    brainMaskNp = sitk.GetArrayFromImage(brainMask)
-    # obsAifVal = imCTC[:, aifCand == aifSegIdx].mean(axis=1)
-    estimAifVal = gv(tIdx, *aifProps)
-    aifVal = estimAifVal
-
-    CBV = np.sum(imCTC, axis=0) / np.sum(aifVal)
-    CBV[brainMaskNp == 0] = outsideValue
-    
-#     colG = np.zeros(2 * tIdx.shape[0])
-#     colG[0] = aifVal[0]
-#     colG[tIdx.shape[0]-1] = (aifVal[tIdx.shape[0]-2] + 4 * aifVal[tIdx.shape[0]-1]) / 6
-#     colG[tIdx.shape[0]] = aifVal[tIdx.shape[0]-1] / 6
-#     for k in range(1, tIdx.shape[0]-1):
-#         colG[k] = (aifVal[k-1] + 4 * aifVal[k] + aifVal[k+1]) / 6
-
-#     rowG = np.zeros(2 * tIdx.shape[0])
-#     rowG[0] = colG[0]
-#     for k in range(1, 2 * tIdx.shape[0]):
-#         rowG[k] = colG[2*tIdx.shape[0] - k]
-
-#     G = toeplitz(colG, rowG)
-
-    cmat = np.zeros([tIdx.shape[0], tIdx.shape[0]])
-    B = np.zeros([tIdx.shape[0], tIdx.shape[0]])
-    for i in range(tIdx.shape[0]):
-        for j in range(tIdx.shape[0]):
-            if i == j:
-                cmat[i, j] = aifVal[0]
-            elif i > j:
-                cmat[i, j] = aifVal[(i-j)]
-            else:
-                B[i, j] = aifVal[tIdx.shape[0] - (j-i)]
-    G = np.vstack([np.hstack([cmat, B]),np.hstack([B, cmat])])
-
-    U, S, V = np.linalg.svd(G)
-    thres = cSVDThres * np.max(S)
-    filteredS = 1 / S
-    filteredS[S < thres] = 0
-    Ginv = V @ np.diag(filteredS) @ U.T
-
-    imCTC_pad = np.pad(imCTC, [(0, imCTC.shape[0]),] + [(0, 0)]*3)
-    CBF_interm = np.abs(np.einsum('ab, bcde->acde', Ginv, imCTC_pad))
-    if outputMethod == 'max':
-        CBF = CBF_interm.max(axis=0)
-    elif outputMethod == 'aggregate':
-        CBF = np.abs(CBF_interm[2:-1] - 2 * CBF_interm[1:-2] + CBF_interm[:-3]).sum(0)
-        CBF /= CBF_interm.shape[0]
+def runDeconv(imCTC, tIdx, brainMask, aifProps, cSVDThres=0.1, method='bcSVD1', outsideValue=-1):
+    if type(brainMask) is sitk.Image:
+        brainMaskNp = sitk.GetArrayFromImage(brainMask)
     else:
-        raise NotImplementedError(f"outputMethod {outputMethod} is not supported.")
+        brainMaskNp = brainMask
+        
+    rho, H=1.05, 0.85
+    # obsAifVal = imCTC[:, aifCand == aifSegIdx].mean(axis=1)
+    
+    if len(aifProps) != len(tIdx):
+        estimAifVal = gv(tIdx, *aifProps)
+        aifVal = estimAifVal
+    else:
+        aifVal = aifProps
+    
+    deltaT = np.mean(np.diff(tIdx))
+
+#     CBV = np.sum(imCTC, axis=0) / np.sum(aifVal)
+#     CBV[brainMaskNp == 0] = outsideValue
+    
+    if method == 'oSVD':
+        # original SVD method
+        G = toeplitz(aifVal, np.zeros(aifVal.shape[0]))
+        imCTC_pad = imCTC
+    elif method == 'bcSVD1':
+        # bcSVD method 1
+        colG = np.zeros(2 * tIdx.shape[0])
+        colG[0] = aifVal[0]
+        colG[tIdx.shape[0]-1] = (aifVal[tIdx.shape[0]-2] + 4 * aifVal[tIdx.shape[0]-1]) / 6
+        colG[tIdx.shape[0]] = aifVal[tIdx.shape[0]-1] / 6
+        for k in range(1, tIdx.shape[0]-1):
+            colG[k] = (aifVal[k-1] + 4 * aifVal[k] + aifVal[k+1]) / 6
+
+        rowG = np.zeros(2 * tIdx.shape[0])
+        rowG[0] = colG[0]
+        for k in range(1, 2 * tIdx.shape[0]):
+            rowG[k] = colG[2*tIdx.shape[0] - k]
+
+        G = toeplitz(colG, rowG)
+        imCTC_pad = np.pad(imCTC, [(0, imCTC.shape[0]),] + [(0, 0)]*3)
+    elif method == 'bcSVD2':
+        # bcSVD method 2
+        cmat = np.zeros([tIdx.shape[0], tIdx.shape[0]])
+        B = np.zeros([tIdx.shape[0], tIdx.shape[0]])
+        for i in range(tIdx.shape[0]):
+            for j in range(tIdx.shape[0]):
+                if i == j:
+                    cmat[i, j] = aifVal[0]
+                elif i > j:
+                    cmat[i, j] = aifVal[(i-j)]
+                else:
+                    B[i, j] = aifVal[tIdx.shape[0] - (j-i)]
+        G = np.vstack([np.hstack([cmat, B]),np.hstack([B, cmat])])
+        imCTC_pad = np.pad(imCTC, [(0, imCTC.shape[0]),] + [(0, 0)]*3)
+    else:
+        raise NotImplementedError(f"method {method} is not supported.")
+
+    U, S, V = np.linalg.svd(G * deltaT)
+    thres = cSVDThres * np.max(S)
+    filteredS = 1 / (S + 1e-5)
+    filteredS[S < thres] = 0
+    Ginv = V.T @ np.diag(filteredS) @ U.T
+    
+    k = np.abs(np.einsum('ab, bcde->acde', Ginv, imCTC_pad))
+    
+    k = k[:tIdx.shape[0]]
+    CBF = H / rho * k.max(axis=0) * 60 * 100
+    CBV = H / rho * k.sum(axis=0) * 100
+    tMax = tIdx[k.argmax(axis=0)]
+    
+    
+    tMax[brainMaskNp == 0] = outsideValue
+    CBV[brainMaskNp == 0] = outsideValue
     CBF[brainMaskNp == 0] = outsideValue
-    MTT = CBV / CBF
+    MTT = CBV / CBF * 60
     MTT[brainMaskNp == 0] = outsideValue
     
-    return MTT, CBV, CBF
+    return MTT, CBV, CBF, tMax
 
